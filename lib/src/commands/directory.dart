@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
+
+import 'package:ftpconnect/src/ftp_unknown_command_exception.dart';
 
 import '../ftp_entry.dart';
 import '../ftp_exceptions.dart';
@@ -45,7 +46,23 @@ class FTPDirectory {
     return sResponse.message.substring(iStart, iEnd);
   }
 
+  /// List the directory content
+  ///
+  /// Try to use MLSD or fallback to LIST if the command is unknown
   Future<List<FTPEntry>> directoryContent() async {
+    try {
+      return await _directoryContent();
+    } on FTPUnknownCommandException catch (e) {
+      // Try to use the LIST command
+      if (_socket.listCommand == ListCommand.MLSD) {
+        _socket.listCommand = ListCommand.LIST;
+        return await _directoryContent();
+      } else
+        throw FTPConnectException(e.message);
+    }
+  }
+
+  Future<List<FTPEntry>> _directoryContent() async {
     // Enter passive mode
     FTPReply response = await _socket.openDataTransferChannel();
 
@@ -54,22 +71,64 @@ class FTPDirectory {
 
     // Data transfer socket
     int iPort = Utils.parsePort(response.message, _socket.supportIPV6);
-    Socket dataSocket = await Socket.connect(_socket.host, iPort,
-        timeout: Duration(seconds: _socket.timeout));
+
+    // dataSocket should be RawSecureSocket if the connection type is FTPS
+    RawSocket dataSocket;
+    try {
+      if (_socket.securityType != SecurityType.FTP) {
+        dataSocket = await RawSecureSocket.connect(
+          _socket.host,
+          iPort,
+          timeout: Duration(seconds: _socket.timeout),
+          onBadCertificate: (certificate) => true,
+        );
+      } else {
+        dataSocket = await RawSocket.connect(
+          _socket.host,
+          iPort,
+          timeout: Duration(seconds: _socket.timeout),
+        );
+      }
+    } catch (e) {
+      throw FTPConnectException(
+          'Could not open the data connection to ${_socket.host} ($iPort)',
+          e.toString());
+    }
+
     //Test if second socket connection accepted or not
     response = await _socket.readResponse();
     //some server return two lines 125 and 226 for transfer finished
     bool isTransferCompleted = response.isSuccessCode();
     if (!isTransferCompleted && response.code != 125 && response.code != 150) {
+      if (response.code == 500) {
+        throw FTPUnknownCommandException("Unknown command exception");
+      }
       throw FTPConnectException('Connection refused. ', response.message);
     }
 
     List<int> lstDirectoryListing = [];
-    await dataSocket.listen((Uint8List data) {
-      lstDirectoryListing.addAll(data);
+    // Listen for data from the server
+    await dataSocket.listen((event) {
+      switch (event) {
+        case RawSocketEvent.read:
+          final data = dataSocket.read();
+          if (data != null) {
+            lstDirectoryListing.addAll(data);
+          }
+          break;
+        case RawSocketEvent.write:
+          //dataSocket.write(Utf8Codec().encode('$cmd\r\n'));
+          dataSocket.writeEventsEnabled = false;
+          break;
+        case RawSocketEvent.readClosed:
+          dataSocket.close();
+          break;
+        case RawSocketEvent.closed:
+          break;
+        default:
+          throw "Unexpected event $event";
+      }
     }).asFuture();
-
-    await dataSocket.close();
 
     if (!isTransferCompleted) {
       response = await _socket.readResponse();
